@@ -8,6 +8,9 @@ dependencies = [
     "textual>=0.80",
 ]
 
+[project.scripts]
+nocfo-explorer = "nocfo_explorer.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8",
