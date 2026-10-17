@@ -953,3 +953,166 @@ async def test_rename_to_an_empty_name_reports_an_error(cfg, fake):
         await settle_op(pilot)
         assert fake.files[ids["note"]]["name"] == "note.txt"  # unchanged
         assert fake.count("update_file") == 0
+
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+
+async def run_search(pilot, term: str) -> None:
+    """Open the search prompt, type a term and submit it."""
+    await pilot.press("/")
+    await settle(pilot)
+    for ch in term:
+        await pilot.press(ch)
+    await pilot.press("enter")
+    await settle_op(pilot)
+
+
+async def test_search_shows_matches_and_marks_the_path(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await run_search(pilot, "note")
+        assert app.search_term == "note"
+        assert names(app) == ["alpha-notes.md", "note.txt"]
+        assert app.query_one("#current").option_count == 2
+        assert highlighted(app) == 0
+        assert "[search: note]" in path_text(app)
+        assert "/ search" in status_text(app)
+
+
+async def test_search_matches_are_case_insensitive(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await run_search(pilot, "ALPHA")
+        assert names(app) == ["alpha-notes.md"]
+
+
+async def test_search_with_no_matches_shows_an_empty_pane(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await run_search(pilot, "zzzz")
+        assert app.search_term == "zzzz"
+        assert names(app) == []
+        assert app.query_one("#current").option_count == 0
+        assert "[search: zzzz]" in path_text(app)
+
+
+async def test_blank_search_term_changes_nothing(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("/")
+        await settle(pilot)
+        assert isinstance(app.screen, InputScreen)
+        await pilot.press("space")
+        await pilot.press("enter")
+        await settle_op(pilot)
+        assert not isinstance(app.screen, InputScreen)
+        assert app.search_term is None
+        assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]
+
+
+async def test_cancel_search_with_escape_changes_nothing(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("/")
+        await settle(pilot)
+        await pilot.press("n", "o")
+        await pilot.press("escape")
+        await settle(pilot)
+        assert not isinstance(app.screen, InputScreen)
+        assert app.search_term is None
+        assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]
+
+
+async def test_escape_exits_search_and_restores_the_cursor(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j")  # cursor on note.txt (index 2)
+        assert highlighted(app) == 2
+        await run_search(pilot, "deep")
+        assert names(app) == ["deep.csv"]
+        await pilot.press("escape")
+        await settle(pilot)
+        assert app.search_term is None
+        assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]
+        assert "[search" not in path_text(app)
+        assert highlighted(app) == 2  # back where the cursor was
+
+
+async def test_reload_exits_search(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await run_search(pilot, "note")
+        assert app.search_term == "note"
+        await pilot.press("R")
+        await settle_op(pilot)
+        assert app.search_term is None
+        assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]
+
+
+async def test_enter_on_a_search_result_jumps_to_its_folder(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await run_search(pilot, "deep")
+        assert names(app) == ["deep.csv"]
+        await pilot.press("enter")  # file in search mode -> go to its folder
+        await settle_op(pilot)
+        assert app.search_term is None
+        assert [seg.name for seg in app.path] == ["root", "Alpha", "Sub"]
+        assert names(app) == ["deep.csv"]
+        assert highlighted(app) == 0
+        assert path_text(app).endswith("/Alpha/Sub")
+        assert fake.count("search_files") == 1  # the jump itself searched nothing
+
+
+async def test_l_on_a_search_result_jumps_too(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await run_search(pilot, "alpha")
+        assert names(app) == ["alpha-notes.md"]
+        await pilot.press("l")
+        await settle_op(pilot)
+        assert app.search_term is None
+        assert [seg.name for seg in app.path] == ["root", "Alpha"]
+        assert "alpha-notes.md" in names(app)
+        assert names(app)[highlighted(app)] == "alpha-notes.md"
+
+
+async def test_mark_and_delete_work_on_search_results(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await run_search(pilot, "deep")
+        await pilot.press("space")  # mark the only match
+        assert len(app.marks) == 1
+        await pilot.press("d")
+        await settle(pilot)
+        assert isinstance(app.screen, ConfirmScreen)
+        assert "deep.csv" in str(app.screen.detail)
+        await pilot.press("y")
+        await settle_op(pilot)
+        assert not any(f["name"] == "deep.csv" for f in fake.files.values())
+        assert app.search_term is None  # the reload ended search mode
+        assert app.marks == {}
+        assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]

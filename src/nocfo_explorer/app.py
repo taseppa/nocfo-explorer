@@ -58,7 +58,7 @@ TEXT_EXTS = {
     "gitignore", "rst", "rtf",
 }
 
-HINT = "space mark · h/l dir · y/x yank · p paste · d del · a mkdir · r rename · q quit"
+HINT = "space mark · h/l dir · y/x yank · p paste · d del · / search · q quit"
 
 
 @dataclass
@@ -237,6 +237,8 @@ class ExplorerApp(App[None]):
         Binding("d", "delete", "Delete"),
         Binding("a", "new_folder", show=False),
         Binding("r", "rename", show=False),
+        # search
+        Binding("/", "search", "Search"),
         # misc
         Binding("R", "reload", "Refresh", show=False),
     ]
@@ -265,6 +267,11 @@ class ExplorerApp(App[None]):
 
         self.attached_ids: set[int] | None = None  # None = not fetched yet
         self._attached_failed = False
+
+        # search mode: while set, the current pane shows whole-business
+        # file matches instead of the open folder's listing.
+        self.search_term: str | None = None
+        self._search_prev_cursor_key: tuple[str, int | None] | None = None
 
         # caches: folder key -> (time, entries); folder id -> (time, detail)
         self._listing_cache: dict[int | None, tuple[float, list[Entry]]] = {}
@@ -496,6 +503,7 @@ class ExplorerApp(App[None]):
         if seq != self._load_seq:
             return  # superseded by a newer navigation
         previous = self._highlighted_entry()  # against the OLD entries
+        self.search_term = None  # a folder load ends search mode
         self.entries = entries
         self.parent_entries = parent_entries
         self._render_current(
@@ -508,6 +516,7 @@ class ExplorerApp(App[None]):
     def _apply_load_error(self, seq: int, message: str) -> None:
         if seq != self._load_seq:
             return
+        self.search_term = None
         self.entries = []
         self.parent_entries = []
         self._render_current()
@@ -592,6 +601,9 @@ class ExplorerApp(App[None]):
         t.append("nocfo-explorer", style="bold")
         t.append(f" · {business} · ", style="dim")
         t.append(path_str)
+        if self.search_term is not None:
+            t.append(f"   [search: {self.search_term}]", style="bold cyan")
+            t.append("  (esc exits)", style="dim")
         self.query_one("#path", Static).update(t)
 
     def _update_status(self, error: str | None = None) -> None:
@@ -636,7 +648,10 @@ class ExplorerApp(App[None]):
         if entry.kind == "folder":
             self._descend(entry)
         elif control is not None and control.id == "current":
-            self._open_in_browser(entry)
+            if self.search_term is not None:
+                self._jump_to_entry(entry)
+            else:
+                self._open_in_browser(entry)
 
     def _entry_from_option(self, option, control) -> Entry | None:
         if option is None or option.id is None:
@@ -874,14 +889,19 @@ class ExplorerApp(App[None]):
         self._push_history()
         self.reload()  # cursor starts at the top, like yazi
 
-    def action_enter(self) -> None:
-        entry = self._highlighted_entry()
+    def _activate(self, entry: Entry | None) -> None:
+        """Enter/l on an entry: descend, jump out of search, or open it."""
         if entry is None:
             return
         if entry.kind == "folder":
             self._descend(entry)
+        elif self.search_term is not None:
+            self._jump_to_entry(entry)  # search results: go to where it lives
         else:
             self._open_in_browser(entry)
+
+    def action_enter(self) -> None:
+        self._activate(self._highlighted_entry())
 
     def action_leave(self) -> None:
         if len(self.path) <= 1:
@@ -947,6 +967,11 @@ class ExplorerApp(App[None]):
 
     def action_escape(self) -> None:
         self.query_one("#current", OptionList).focus()
+        if self.search_term is not None:
+            self.search_term = None
+            self.reload(cursor_key=self._search_prev_cursor_key)
+            self.notify("search closed")
+            return
         if self.marks:
             n = len(self.marks)
             self.marks.clear()
@@ -1238,6 +1263,98 @@ class ExplorerApp(App[None]):
             self.invalidate()
             self.reload(cursor_key=entry.key)
             self.notify(f"renamed to {new_name.strip()!r}")
+        finally:
+            self._op_busy = False
+
+    # ------------------------------------------------------------------
+    # search
+    # ------------------------------------------------------------------
+
+    def action_search(self) -> None:
+        if self.client is None or self._op_busy:
+            return
+        self._op_busy = True
+        self.run_worker(self._search_flow(), group="op", exclusive=True)
+
+    async def _search_flow(self) -> None:
+        """Ask for a term, then fetch the whole-business file matches."""
+        try:
+            term = await self._ask(
+                InputScreen(
+                    "Search files",
+                    placeholder="name contains…",
+                    hint="enter searches every folder; esc cancels",
+                )
+            )
+            self._refocus()
+            if term is None:
+                return
+            term = term.strip()
+            if not term:
+                self.notify("empty search — nothing to do")
+                return
+            client = self.client
+            if client is None:
+                return
+            files = await asyncio.to_thread(client.search_files, term)
+            entries = build_entries([], list(files))
+            self._apply_search(term, entries)
+        except Exception as e:  # NoCfoError or anything unexpected
+            self.notify(f"search failed: {e}", severity="error", timeout=8)
+        finally:
+            self._op_busy = False
+
+    def _apply_search(self, term: str, entries: list[Entry]) -> None:
+        prev = self._highlighted_entry()
+        self._search_prev_cursor_key = prev.key if prev else None
+        self.search_term = term
+        self.entries = entries
+        cl = self.query_one("#current", OptionList)
+        cl.clear_options()
+        if entries:
+            cl.add_options([self._option(e) for e in entries])
+        cl.highlighted = 0 if entries else None
+        cl.scroll_home(animate=False)
+        self._render_parent()
+        self._update_path()
+        self._update_status()
+        noun = "match" if len(entries) == 1 else "matches"
+        self.notify(f"{len(entries)} {noun} for {term!r}")
+
+    def _jump_to_entry(self, entry: Entry) -> None:
+        """Leave search mode and open the folder that holds this file."""
+        if self.client is None or self._op_busy:
+            return
+        self._op_busy = True
+        self.run_worker(self._jump_flow(entry), group="op", exclusive=True)
+
+    async def _jump_flow(self, entry: Entry) -> None:
+        try:
+            folder_id = entry.file.folder_id if entry.file is not None else None
+            if folder_id is None:
+                new_path = [ROOT]  # lives at the business root
+            else:
+                detail = await asyncio.to_thread(self._folder_detail, folder_id)
+                crumbs = [
+                    c
+                    for c in (detail.breadcrumbs or [])
+                    if isinstance(c, dict) and c.get("id") is not None
+                ]
+                new_path = [
+                    Entry("folder", int(c["id"]), str(c.get("name", c["id"])))
+                    for c in crumbs
+                ]
+            # breadcrumbs only list real folders: the pseudo-root (id None)
+            # that every normal path starts with is missing — put it back.
+            if not new_path or new_path[0].id is not None:
+                new_path = [ROOT, *new_path]
+            self.path = new_path
+            self.search_term = None
+            self._push_history()
+            self.reload(cursor_key=entry.key)
+            self.notify(f"jumped to {entry.name}")
+        except Exception as e:
+            self.notify(f"could not locate {entry.name}: {e}", severity="warning")
         finally:
             self._op_busy = False
 
