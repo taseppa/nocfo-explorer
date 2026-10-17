@@ -34,12 +34,15 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
+from . import ops
 from .config import Config, ConfigError, save_config
 from .nocfo import NoCfoClient, NoCfoError, NocfoFile, NocfoFolder
 from .screens import (
     AuthScreen,
     BusinessPickerScreen,
+    ConfirmScreen,
     InfoScreen,
+    InputScreen,
     TokenScreen,
 )
 
@@ -55,7 +58,7 @@ TEXT_EXTS = {
     "gitignore", "rst", "rtf",
 }
 
-HINT = "space mark · h/l dir · j/k move · o open · q quit"
+HINT = "space mark · h/l dir · y/x yank · p paste · d del · a mkdir · r rename · q quit"
 
 
 @dataclass
@@ -224,6 +227,16 @@ class ExplorerApp(App[None]):
         Binding("ctrl+a", "mark_all", show=False),
         Binding("ctrl+r", "invert_marks", show=False),
         Binding("escape", "escape", "Clear", show=False),
+        # operations
+        Binding("y", "yank", "Yank"),
+        Binding("x", "cut", "Cut"),
+        Binding("Y", "unyank", show=False),
+        Binding("X", "unyank", show=False),
+        Binding("p", "paste", "Paste"),
+        Binding("P", "paste_force", show=False),
+        Binding("d", "delete", "Delete"),
+        Binding("a", "new_folder", show=False),
+        Binding("r", "rename", show=False),
         # misc
         Binding("R", "reload", "Refresh", show=False),
     ]
@@ -263,6 +276,7 @@ class ExplorerApp(App[None]):
         self._load_seq = 0
         self._preview_seq = 0
         self._gg_pending = False  # saw "g"; a second "g" jumps to the top
+        self._op_busy = False  # a mutation is running: ignore repeat keys
 
     # ------------------------------------------------------------------
     # compose / startup
@@ -946,6 +960,286 @@ class ExplorerApp(App[None]):
         if advance:
             cl = self.query_one("#current", OptionList)
             cl.action_cursor_down()
+
+    # ------------------------------------------------------------------
+    # operations: yank/cut, paste, delete, new folder, rename
+    # ------------------------------------------------------------------
+
+    def _selected_entries(self) -> list[Entry]:
+        """The marked items if any, else just the hovered one."""
+        if self.marks:
+            return list(self.marks.values())
+        entry = self._highlighted_entry()
+        return [entry] if entry else []
+
+    @staticmethod
+    def _targets(entries: list[Entry]) -> list[ops.Target]:
+        return [
+            ops.Target(e.kind, e.id, e.name) for e in entries if e.id is not None
+        ]
+
+    def _refocus(self) -> None:
+        """Back on the interactive pane after a modal screen closes."""
+        self.query_one("#current", OptionList).focus()
+
+    def _forget_keys(self, keys: set) -> None:
+        """Drop entries (marks, yank) that no longer apply."""
+        for key in keys:
+            self.marks.pop(key, None)
+        if self.yank_items:
+            self.yank_items = [e for e in self.yank_items if e.key not in keys]
+            if not self.yank_items:
+                self.yank_items = None
+                self.yank_cut = False
+        self._update_status()
+
+    def _survivor_key(self, removed: set) -> tuple | None:
+        """Where the cursor lands after ``removed`` entries disappear: the
+        first kept entry at or after them, else the last one before."""
+        first = next(
+            (i for i, e in enumerate(self.entries) if e.key in removed), None
+        )
+        if first is None:
+            current = self._highlighted_entry()
+            return current.key if current else None
+        for e in self.entries[first:]:
+            if e.key not in removed:
+                return e.key
+        for e in reversed(self.entries[:first]):
+            if e.key not in removed:
+                return e.key
+        return None
+
+    def _report(self, verb: str, total: int, failures: list[str]) -> None:
+        if failures:
+            shown = "; ".join(failures[:3])
+            if len(failures) > 3:
+                shown += f" (+{len(failures) - 3} more)"
+            self.notify(
+                f"{verb} {total - len(failures)}/{total} — {shown}",
+                severity="warning",
+                timeout=8,
+            )
+        else:
+            self.notify(f"{verb} {total} item" + ("s" if total != 1 else ""))
+
+    def action_yank(self) -> None:
+        entries = self._selected_entries()
+        if not entries:
+            return
+        self.yank_items = entries
+        self.yank_cut = False
+        self._update_status()
+        self.notify(f"yanked {len(entries)} — p pastes a copy")
+
+    def action_cut(self) -> None:
+        entries = self._selected_entries()
+        if not entries:
+            return
+        self.yank_items = entries
+        self.yank_cut = True
+        self._update_status()
+        self.notify(f"cut {len(entries)} — p moves them here")
+
+    def action_unyank(self) -> None:
+        if self.yank_items:
+            self.notify(f"forgot {len(self.yank_items)} items")
+        self.yank_items = None
+        self.yank_cut = False
+        self._update_status()
+
+    # Textual awaits key actions inline in the message pump, so anything
+    # that awaits a modal dialog or a network call must run in a worker
+    # task instead — otherwise the pump deadlocks (the key that would
+    # dismiss the dialog can never be processed).
+
+    def action_paste(self) -> None:
+        self._start_paste(force=False)
+
+    def action_paste_force(self) -> None:
+        self._start_paste(force=True)
+
+    def _start_paste(self, *, force: bool) -> None:
+        if self.client is None or self._op_busy:
+            return
+        if not self.yank_items:
+            self.notify("nothing to paste — yank (y) or cut (x) first")
+            return
+        entries = list(self.yank_items)
+        if not self._targets(entries):
+            return
+        self._op_busy = True
+        self.run_worker(
+            self._paste_flow(entries, force=force), group="op", exclusive=True
+        )
+
+    async def _paste_flow(self, entries: list[Entry], *, force: bool) -> None:
+        try:
+            targets = self._targets(entries)
+            client = self.client
+            dest_id = self.path[-1].id  # None = the folder root
+            cut = self.yank_cut
+            if cut:
+                failures = await asyncio.to_thread(
+                    ops.move_entries, client, targets, dest_id
+                )
+                verb = "moved"
+            else:
+                failures = await asyncio.to_thread(
+                    ops.copy_entries, client, targets, dest_id, force=force
+                )
+                verb = "copied"
+            keys = {e.key for e in entries}
+            if cut:
+                self._forget_keys(keys)
+                self.invalidate()
+                self.reload(cursor_key=self._survivor_key(keys))
+            else:
+                # copies leave this listing's keys intact, but new items appeared
+                self.invalidate()
+                self.reload()
+                # the yank stays so it can be pasted into more folders
+            self._report(verb, len(targets), failures)
+            if cut and failures:
+                # keep the cut so the failed ones can be retried
+                self.yank_items = entries
+                self.yank_cut = True
+                self._update_status()
+        finally:
+            self._op_busy = False
+
+    def action_delete(self) -> None:
+        if self.client is None or self._op_busy:
+            return
+        entries = self._selected_entries()
+        if not entries:
+            return
+        self._op_busy = True
+        self.run_worker(self._delete_flow(entries), group="op", exclusive=True)
+
+    async def _delete_flow(self, entries: list[Entry]) -> None:
+        try:
+            client = self.client
+            if client is None:
+                return
+            detail = await asyncio.to_thread(self._delete_detail, entries, client)
+            title = (
+                f"Delete {entries[0].name!r} permanently?"
+                if len(entries) == 1
+                else f"Delete {len(entries)} items permanently?"
+            )
+            confirmed = await self._ask(ConfirmScreen(title, detail))
+            self._refocus()
+            if not confirmed:
+                return
+            targets = self._targets(entries)
+            failures = await asyncio.to_thread(ops.delete_entries, client, targets)
+            keys = {e.key for e in entries}
+            self._forget_keys(keys)
+            self.invalidate()
+            self.reload(cursor_key=self._survivor_key(keys))
+            self._report("deleted", len(targets), failures)
+        finally:
+            self._op_busy = False
+
+    def _delete_detail(self, entries: list[Entry], client: Any) -> str:
+        """The confirm dialog body: one line per target, warnings inline
+        (runs in a thread — it may sweep the attached-file index)."""
+        if self.attached_ids is None and not self._attached_failed:
+            try:
+                self.attached_ids = client.attached_file_ids()
+            except NoCfoError:
+                self._attached_failed = True
+        lines: list[str] = []
+        for e in entries[:15]:
+            label = e.name + ("/" if e.kind == "folder" else "")
+            suffix = ""
+            if e.kind == "folder":
+                try:
+                    if client.get_folder(e.id).has_content:
+                        suffix = "  (not empty — skipped)"
+                except NoCfoError as exc:
+                    suffix = f"  ({exc})"
+            else:
+                file = e.file
+                if file is not None and getattr(file, "is_deletable", None) is False:
+                    suffix = "  (locked — may fail)"
+                elif self.attached_ids is not None and e.id in self.attached_ids:
+                    suffix = "  (attached to a document)"
+            lines.append(f"  {label}{suffix}")
+        if len(entries) > 15:
+            lines.append(f"  … and {len(entries) - 15} more")
+        return "\n".join(lines)
+
+    def action_new_folder(self) -> None:
+        if self.client is None or self._op_busy:
+            return
+        self._op_busy = True
+        self.run_worker(self._new_folder_flow(), group="op", exclusive=True)
+
+    async def _new_folder_flow(self) -> None:
+        try:
+            name = await self._ask(
+                InputScreen(
+                    "New folder",
+                    placeholder="folder name",
+                    hint=f"created inside {self.path[-1].name}/",
+                )
+            )
+            self._refocus()
+            if name is None:
+                return
+            client = self.client
+            dest_id = self.path[-1].id
+            try:
+                new_id = await asyncio.to_thread(
+                    ops.create_folder, client, name, dest_id
+                )
+            except ops.OpsError as e:
+                self.notify(str(e), severity="error", timeout=8)
+                return
+            self.invalidate()
+            self.reload(cursor_key=("folder", new_id))
+            self.notify(f"created {name.strip()!r}")
+        finally:
+            self._op_busy = False
+
+    def action_rename(self) -> None:
+        if self.client is None or self._op_busy:
+            return
+        entry = self._highlighted_entry()
+        if entry is None:
+            return
+        self._op_busy = True
+        self.run_worker(self._rename_flow(entry), group="op", exclusive=True)
+
+    async def _rename_flow(self, entry: Entry) -> None:
+        try:
+            new_name = await self._ask(
+                InputScreen(
+                    f"Rename {entry.name}",
+                    value=entry.name,
+                    cursor_position=rename_cursor_position(entry.name),
+                )
+            )
+            self._refocus()
+            if new_name is None or new_name.strip() == entry.name:
+                return
+            client = self.client
+            target = ops.Target(entry.kind, entry.id, entry.name)
+            parent_id = self.path[-1].id
+            try:
+                await asyncio.to_thread(
+                    ops.rename_entry, client, target, new_name, parent_id=parent_id
+                )
+            except ops.OpsError as e:
+                self.notify(str(e), severity="error", timeout=8)
+                return
+            self.invalidate()
+            self.reload(cursor_key=entry.key)
+            self.notify(f"renamed to {new_name.strip()!r}")
+        finally:
+            self._op_busy = False
 
     # ------------------------------------------------------------------
     # preview seek / open / quit
