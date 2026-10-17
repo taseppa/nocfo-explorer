@@ -1,0 +1,12 @@
+# Copy to config.toml (the TUI's default location is
+# ~/.config/nocfo-explorer/config.toml) and fill it in — or just run
+# `nocfo-explorer` with no arguments: the first-run wizard asks for the
+# token, picks the business, and writes the file for you.
+
+[nocfo]
+# Shared connection settings.
+# Production (default): https://api.nocfo.io   Test: https://api-tst.nocfo.io
+base_url = "https://api.nocfo.io"
+token = "your-personal-access-token"
+# The business to explore (slug from GET /v1/business/).
+business_slug = "your-business-slug"
