@@ -1,0 +1,15 @@
+# local config / credentials
+config.toml
+config
+
+# local state
+.state/
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
