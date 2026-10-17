@@ -21,7 +21,13 @@ from nocfo_explorer.app import (
 )
 from nocfo_explorer.config import Config
 from nocfo_explorer.nocfo import NoCfoError, NocfoFile, NocfoFolder
-from nocfo_explorer.screens import AuthScreen, BusinessPickerScreen, TokenScreen
+from nocfo_explorer.screens import (
+    AuthScreen,
+    BusinessPickerScreen,
+    ConfirmScreen,
+    InputScreen,
+    TokenScreen,
+)
 from tests.conftest import FakeClient
 
 # ---------------------------------------------------------------------------
@@ -86,6 +92,11 @@ async def settle(pilot, t: float = 0.25) -> None:
 async def settle_preview(pilot) -> None:
     """Wait out the hover debounce (0.18s) plus the preview worker."""
     await pilot.pause(0.5)
+
+
+async def settle_op(pilot) -> None:
+    """Wait out a mutation (thread) plus its follow-up listing load."""
+    await pilot.pause(0.6)
 
 
 def file_id(fake: FakeClient, name: str) -> int:
@@ -626,3 +637,319 @@ async def test_q_quits(cfg, fake):
         await settle(pilot)
         await pilot.press("q")
         assert not app.is_running
+
+# ---------------------------------------------------------------------------
+# operations: yank/cut + paste
+# ---------------------------------------------------------------------------
+
+
+async def test_yank_cut_and_unyank_show_in_status(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("y")
+        assert "yank: 1 items" in status_text(app)
+        await pilot.press("Y")
+        assert "items" not in status_text(app)
+        await pilot.press("x")
+        assert "cut: 1 items" in status_text(app)
+        await pilot.press("X")
+        assert "items" not in status_text(app)
+
+
+async def test_cut_and_paste_moves_the_file(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "x")  # cut note.txt
+        assert "cut: 1 items" in status_text(app)
+        await pilot.press("k")  # back up to Zeta
+        await pilot.press("l")  # into the empty folder
+        await settle(pilot)
+        await pilot.press("p")
+        await settle_op(pilot)
+        assert fake.files[ids["note"]]["folder_id"] == ids["zeta"]
+        assert names(app) == ["note.txt"]
+        assert "items" not in status_text(app)  # cut consumed
+        await pilot.press("h")
+        await settle(pilot)
+        assert "note.txt" not in names(app)
+        assert names(app) == ["Alpha", "Zeta", "report.pdf"]
+
+
+async def test_yank_and_paste_copies_the_file(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "y")  # yank note.txt
+        await pilot.press("k", "l")  # into Zeta
+        await settle(pilot)
+        await pilot.press("p")
+        await settle_op(pilot)
+        copies = [f for f in fake.files.values() if f["folder_id"] == ids["zeta"]]
+        assert len(copies) == 1
+        assert fake.contents[copies[0]["id"]] == b"top secret\nsecond line\n"
+        assert fake.files[ids["note"]]["folder_id"] is None  # source intact
+        assert "yank: 1 items" in status_text(app)  # yank survives a copy
+
+
+async def test_paste_collision_suffix_then_force_overwrite(cfg, fake):
+    ids = seed_tree(fake)
+    victim = fake.add_file("note.txt", folder=ids["zeta"], content=b"OLD DEST\n")
+    src_bytes = b"top secret\nsecond line\n"
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "y")  # yank the root copy
+        await pilot.press("k", "l")  # into Zeta (which already has note.txt)
+        await settle(pilot)
+        await pilot.press("p")  # plain paste steps aside
+        await settle_op(pilot)
+        copy = next(
+            f for f in fake.files.values() if f["name"] == "note (copy).txt"
+        )
+        assert copy["folder_id"] == ids["zeta"]
+        assert fake.contents[copy["id"]] == src_bytes
+        # force paste replaces the destination's own note.txt
+        await pilot.press("P")
+        await settle_op(pilot)
+        assert victim not in fake.files
+        replacements = [
+            f
+            for f in fake.files.values()
+            if f["name"] == "note.txt" and f["folder_id"] == ids["zeta"]
+        ]
+        assert len(replacements) == 1
+        assert fake.contents[replacements[0]["id"]] == src_bytes
+        assert "yank: 1 items" in status_text(app)
+
+
+async def test_paste_into_the_cut_folder_itself_is_refused(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("x")  # cut Alpha (cursor starts on it)
+        await pilot.press("l")  # enter Alpha
+        await settle(pilot)
+        await pilot.press("p")
+        await settle_op(pilot)
+        assert fake.folders[ids["alpha"]]["parent"] is None  # unchanged
+        assert names(app) == ["Sub", "alpha-notes.md"]
+        assert "cut: 1 items" in status_text(app)  # kept for a retry
+
+
+async def test_paste_with_nothing_yanked_is_harmless(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        before = set(fake.files)
+        await pilot.press("p")
+        await settle_op(pilot)
+        assert set(fake.files) == before
+        assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]
+        assert "items" not in status_text(app)
+
+
+# ---------------------------------------------------------------------------
+# operations: delete
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_dialog_cancel_changes_nothing(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "d")  # note.txt
+        await settle(pilot)
+        assert isinstance(app.screen, ConfirmScreen)
+        assert "note.txt" in app.screen.detail
+        assert "permanently" in app.screen.title_text
+        await pilot.press("n")
+        await settle(pilot)
+        assert not isinstance(app.screen, ConfirmScreen)
+        assert ids["note"] in fake.files
+        assert names(app)[2] == "note.txt"
+        assert highlighted(app) == 2
+        assert app.focused.id == "current"  # refocused after the modal
+
+
+async def test_delete_confirm_removes_file_and_keeps_cursor_placed(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "d")
+        await settle(pilot)
+        await pilot.press("y")
+        await settle_op(pilot)
+        assert ids["note"] not in fake.files
+        assert names(app) == ["Alpha", "Zeta", "report.pdf"]
+        assert names(app)[highlighted(app)] == "report.pdf"  # next survivor
+        assert app.focused.id == "current"
+
+
+async def test_delete_marks_skips_nonempty_folders(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("ctrl+a")  # all four root entries
+        await pilot.press("d")
+        await settle(pilot)
+        assert isinstance(app.screen, ConfirmScreen)
+        assert app.screen.title_text == "Delete 4 items permanently?"
+        assert "Alpha/" in app.screen.detail
+        assert "(not empty — skipped)" in app.screen.detail
+        await pilot.press("y")
+        await settle_op(pilot)
+        # Alpha survives (it has Sub), the rest of the selection is gone
+        assert ids["alpha"] in fake.folders
+        assert ids["sub"] in fake.folders
+        assert ids["zeta"] not in fake.folders
+        assert ids["note"] not in fake.files
+        assert ids["report"] not in fake.files
+        assert names(app) == ["Alpha"]
+        assert app.marks == {}  # marks consumed by the delete
+
+
+async def test_modal_screen_blocks_app_level_keys(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("d")  # confirm on Alpha (non-empty -> warning line)
+        await settle(pilot)
+        assert isinstance(app.screen, ConfirmScreen)
+        stack = len(app.screen_stack)
+        await pilot.press("d", "a", "r", "q")  # none of these may reach the app
+        await settle(pilot)
+        assert isinstance(app.screen, ConfirmScreen)  # still open
+        assert len(app.screen_stack) == stack
+        assert app.is_running
+        await pilot.press("escape")
+        await settle(pilot)
+        assert not isinstance(app.screen, ConfirmScreen)
+
+
+# ---------------------------------------------------------------------------
+# operations: new folder + rename
+# ---------------------------------------------------------------------------
+
+
+async def test_new_folder_is_created_and_selected(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("a")
+        await settle(pilot)
+        assert isinstance(app.screen, InputScreen)
+        await pilot.press(*list("Invoices"), "enter")
+        await settle_op(pilot)
+        created = [f for f in fake.folders.values() if f["name"] == "Invoices"]
+        assert len(created) == 1
+        assert created[0]["parent"] is None
+        assert names(app) == ["Alpha", "Invoices", "Zeta", "note.txt", "report.pdf"]
+        assert names(app)[highlighted(app)] == "Invoices"
+        assert app.focused.id == "current"
+
+
+async def test_new_folder_duplicate_name_reports_an_error(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("a")
+        await settle(pilot)
+        await pilot.press(*list("Alpha"), "enter")
+        await settle_op(pilot)
+        assert len([f for f in fake.folders.values() if f["name"] == "Alpha"]) == 1
+        assert names(app).count("Alpha") == 1
+        assert app.focused.id == "current"
+
+
+async def test_new_folder_cancel_creates_nothing(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("a")
+        await settle(pilot)
+        await pilot.press(*list("Ghost"), "escape")
+        await settle(pilot)
+        assert not any(f["name"] == "Ghost" for f in fake.folders.values())
+        assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]
+
+
+async def test_rename_opens_with_cursor_before_the_extension(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "r")  # note.txt
+        await settle(pilot)
+        assert isinstance(app.screen, InputScreen)
+        field = app.screen.query_one("Input")
+        assert field.value == "note.txt"
+        assert field.cursor_position == 4  # between "note" and ".txt"
+        await pilot.press("s")  # -> "notes.txt"
+        await pilot.press("enter")
+        await settle_op(pilot)
+        assert fake.files[ids["note"]]["name"] == "notes.txt"
+        assert "notes.txt" in names(app)
+        assert "note.txt" not in names(app)
+        assert names(app)[highlighted(app)] == "notes.txt"
+        assert app.focused.id == "current"
+
+
+async def test_rename_to_an_existing_name_reports_an_error(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "r")  # Zeta -> try to rename it to Alpha
+        await settle(pilot)
+        field = app.screen.query_one("Input")
+        assert field.value == "Zeta"
+        for _ in range(4):
+            await pilot.press("backspace")
+        await pilot.press(*list("Alpha"), "enter")
+        await settle_op(pilot)
+        assert fake.folders[ids["zeta"]]["name"] == "Zeta"
+        assert names(app).count("Alpha") == 1
+        assert "Zeta" in names(app)
+
+
+async def test_rename_with_an_unchanged_name_makes_no_api_call(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "r")
+        await settle(pilot)
+        await pilot.press("enter")  # submit the original value
+        await settle(pilot)
+        assert fake.count("update_file") == 0
+        assert fake.count("update_folder") == 0
+
+
+async def test_rename_to_an_empty_name_reports_an_error(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "r")
+        await settle(pilot)
+        await pilot.press("end")  # cursor sits mid-name; go to the end first
+        for _ in range(8):
+            await pilot.press("backspace")
+        await pilot.press("enter")
+        await settle_op(pilot)
+        assert fake.files[ids["note"]]["name"] == "note.txt"  # unchanged
+        assert fake.count("update_file") == 0

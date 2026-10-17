@@ -134,7 +134,9 @@ class FakeClient:
     def _breadcrumbs(self, folder_id: int) -> list[dict]:
         out: list[dict] = []
         cur: int | None = folder_id
-        while cur is not None:
+        seen: set[int] = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
             f = self.folders[cur]
             out.append({"id": f["id"], "name": f["name"]})
             cur = f["parent"]
@@ -264,6 +266,8 @@ class FakeClient:
             **{k: v for k, v in {"name": name, "folder_id": folder_id, "notes": notes}.items() if v is not _UNSET},
         )
         self._maybe_fail()
+        if file_id not in self.files:
+            raise NoCfoError(f"404 file {file_id}", 404)
         r = self.files[file_id]
         if name is not _UNSET:
             r["name"] = name
@@ -278,6 +282,8 @@ class FakeClient:
         self._maybe_fail()
         if file_id in self.locked:
             raise NoCfoError(f"403 file {file_id} not deletable", 403)
+        if file_id not in self.files:
+            raise NoCfoError(f"404 file {file_id}", 404)
         del self.files[file_id]
 
     def upload_file(
