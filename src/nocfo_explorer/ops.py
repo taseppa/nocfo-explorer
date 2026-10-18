@@ -171,6 +171,7 @@ def _delete_folder_tree(
     failures: list[str],
     seen: set[int],
     gone: set[int],
+    deleted_count: list[int],
 ) -> bool:
     """Delete a folder and everything inside it.
 
@@ -194,13 +195,14 @@ def _delete_folder_tree(
             continue
         child_name = str(child.get("name", child["id"]))
         if not _delete_folder_tree(
-            client, int(child["id"]), child_name, failures, seen, gone
+            client, int(child["id"]), child_name, failures, seen, gone, deleted_count
         ):
             ok = False
     for f in client.list_files(folder=folder_id):
         try:
             client.delete_file(f.id)
             gone.add(f.id)
+            deleted_count[0] += 1
         except NoCfoError as e:
             ok = False
             failures.append(f"{f.name}: {e}")
@@ -209,30 +211,37 @@ def _delete_folder_tree(
         return False
     try:
         client.delete_folder(folder_id)
+        deleted_count[0] += 1
     except NoCfoError as e:
         failures.append(f"{name}: {e}")
         return False
     return True
 
 
-def delete_entries(client, targets: list[Target]) -> list[str]:
-    """Delete items; folders are deleted recursively (see above)."""
+def delete_entries(client, targets: list[Target]) -> tuple[list[str], int]:
+    """Delete items; folders are deleted recursively (see above).
+
+    Returns (failures, deleted_count).
+    """
     failures: list[str] = []
     seen: set[int] = set()  # folder ids already visited/deleted
     gone: set[int] = set()  # file ids deleted along the way
+    deleted_count = 0
+    counter = [0]
     for t in targets:
         try:
             if t.kind == "folder":
                 if t.id not in seen:
-                    _delete_folder_tree(client, t.id, t.name, failures, seen, gone)
+                    _delete_folder_tree(client, t.id, t.name, failures, seen, gone, counter)
             else:
                 if t.id in gone:
                     continue  # already deleted as part of a folder target
                 client.delete_file(t.id)
                 gone.add(t.id)
+                counter[0] += 1
         except NoCfoError as e:
             failures.append(f"{t.name}: {e}")
-    return failures
+    return failures, counter[0]
 
 
 # ---------------------------------------------------------------------------

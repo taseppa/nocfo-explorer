@@ -118,6 +118,21 @@ class _Pane(OptionList):
     that being deterministic.
     """
 
+    DEFAULT_CSS = """
+    _Pane {
+        background: $background;
+    }
+    _Pane > .option-list--option {
+        background: $background;
+    }
+    _Pane > .option-list--option-highlighted {
+        background: $accent 40%;
+    }
+    _Pane > .option-list--option-selected {
+        background: $accent;
+    }
+    """
+
     def action_cursor_down(self) -> None:
         if not self.option_count:
             return
@@ -153,36 +168,43 @@ class ExplorerApp(App[None]):
     }
     #cols {
         height: 1fr;
+        background: $background;
     }
     #parent {
         height: 100%;
         width: 26;
         min-width: 12;
         padding: 0 1;
+        background: $background;
     }
     #current {
         height: 100%;
         width: 1fr;
         padding: 0 1;
+        background: $background;
     }
     #previewcol {
         height: 100%;
         width: 44%;
         min-width: 24;
+        background: $background;
     }
     #preview-head {
         height: auto;
         max-height: 11;
         padding: 1 1 0 1;
+        background: $background;
     }
     #preview-scroll {
         height: 1fr;
         padding: 0 1 1 1;
+        background: $background;
     }
     #preview-body {
         width: 100%;
         height: auto;
         color: $text-muted;
+        background: $background;
     }
     #status {
         height: 1;
@@ -1148,7 +1170,11 @@ class ExplorerApp(App[None]):
             self._forget_keys(keys)
             self.invalidate()
             self.reload(cursor_key=self._survivor_key(keys))
-            self._report("deleted", len(targets), failures)
+            if isinstance(failures, tuple):
+                failures_list, deleted_total = failures[0], failures[1]
+            else:
+                failures_list, deleted_total = failures, len(targets)
+            self._report("deleted", deleted_total, failures_list)
         finally:
             self._op_busy = False
 
