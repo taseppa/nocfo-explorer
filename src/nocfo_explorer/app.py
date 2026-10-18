@@ -104,16 +104,6 @@ def is_text_preview(name: str, mime: str) -> bool:
     return mime.startswith("text/") or mime.endswith("+json") or mime.endswith("+xml")
 
 
-def type_tag(name: str, mime: str) -> str:
-    """Short right-hand tag for a file row: the extension, else the MIME."""
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    if ext and len(ext) <= 6:
-        return ext.upper()
-    if mime:
-        return mime.split("/")[-1][:6].upper()
-    return ""
-
-
 def rename_cursor_position(name: str) -> int:
     """Yazi puts the rename cursor before the last extension."""
     stem, dot, _ext = name.rpartition(".")
@@ -169,7 +159,6 @@ class ExplorerApp(App[None]):
         width: 26;
         min-width: 12;
         padding: 0 1;
-        border-right: thick $accent;
     }
     #current {
         height: 100%;
@@ -180,7 +169,6 @@ class ExplorerApp(App[None]):
         height: 100%;
         width: 44%;
         min-width: 24;
-        border-left: thick $accent;
     }
     #preview-head {
         height: auto;
@@ -536,9 +524,6 @@ class ExplorerApp(App[None]):
             prompt.append(e.name + "/", style="bold")
         else:
             prompt.append(e.name)
-            tag = type_tag(e.name, e.mime)
-            if tag:
-                prompt.append(f"  {tag}", style="dim")
         return Option(prompt, id=f"{e.kind}:{e.id}")
 
     def _render_current(
@@ -1182,7 +1167,7 @@ class ExplorerApp(App[None]):
             if e.kind == "folder":
                 try:
                     if client.get_folder(e.id).has_content:
-                        suffix = "  (not empty — skipped)"
+                        suffix = "  (recursive — deletes everything inside)"
                 except NoCfoError as exc:
                     suffix = f"  ({exc})"
             else:

@@ -164,19 +164,72 @@ def move_entries(
 # ---------------------------------------------------------------------------
 
 
+def _delete_folder_tree(
+    client,
+    folder_id: int,
+    name: str,
+    failures: list[str],
+    seen: set[int],
+    gone: set[int],
+) -> bool:
+    """Delete a folder and everything inside it.
+
+    The API only deletes *empty* folders (a non-empty one answers an HTML
+    500), so children go first: subfolders recursively, then the files,
+    then the folder itself.  When anything inside cannot be deleted the
+    folder is kept whole — never a half-deleted surprise — and the
+    failure lands in ``failures``.  Returns whether the folder is gone.
+    """
+    if folder_id in seen:
+        return True  # already visited/deleted (defensive: shared or cyclic refs)
+    seen.add(folder_id)
+    try:
+        detail = client.get_folder(folder_id)
+    except NoCfoError as e:
+        failures.append(f"{name}: {e}")
+        return False
+    ok = True
+    for child in detail.children or []:
+        if not isinstance(child, dict) or child.get("id") is None:
+            continue
+        child_name = str(child.get("name", child["id"]))
+        if not _delete_folder_tree(
+            client, int(child["id"]), child_name, failures, seen, gone
+        ):
+            ok = False
+    for f in client.list_files(folder=folder_id):
+        try:
+            client.delete_file(f.id)
+            gone.add(f.id)
+        except NoCfoError as e:
+            ok = False
+            failures.append(f"{f.name}: {e}")
+    if not ok:
+        failures.append(f"'{name}': contents not fully deleted — folder kept")
+        return False
+    try:
+        client.delete_folder(folder_id)
+    except NoCfoError as e:
+        failures.append(f"{name}: {e}")
+        return False
+    return True
+
+
 def delete_entries(client, targets: list[Target]) -> list[str]:
-    """Delete items; non-empty folders are skipped before the API's HTML 500."""
+    """Delete items; folders are deleted recursively (see above)."""
     failures: list[str] = []
+    seen: set[int] = set()  # folder ids already visited/deleted
+    gone: set[int] = set()  # file ids deleted along the way
     for t in targets:
         try:
             if t.kind == "folder":
-                detail = client.get_folder(t.id)
-                if detail.has_content:
-                    failures.append(f"'{t.name}' is not empty — skipped")
-                    continue
-                client.delete_folder(t.id)
+                if t.id not in seen:
+                    _delete_folder_tree(client, t.id, t.name, failures, seen, gone)
             else:
+                if t.id in gone:
+                    continue  # already deleted as part of a folder target
                 client.delete_file(t.id)
+                gone.add(t.id)
         except NoCfoError as e:
             failures.append(f"{t.name}: {e}")
     return failures

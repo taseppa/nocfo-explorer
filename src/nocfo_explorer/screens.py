@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
@@ -176,37 +176,104 @@ class InputScreen(Screen[str | None]):
 
 
 class ConfirmScreen(Screen[bool]):
-    """Yes/no confirmation.  Enter does nothing, so ``y`` is deliberate."""
+    """Yazi-style centered popup: the doomed items, then a Yes/No selector.
+
+    **Yes** is highlighted by default.  ``y`` decides immediately, ``n`` /
+    ``escape`` cancel, ``enter`` activates the highlighted side, and
+    ``left``/``right``/``tab`` move the highlight.
+    """
 
     CSS = """
-    Screen { align: center middle; }
-    #box { width: 76; border: round $accent; padding: 1 2; }
-    #hint { color: $text-muted; margin-top: 1; }
+    Screen { align: center middle; background: $background 45%; }
+    #box {
+        width: 76;
+        max-width: 100%;
+        height: auto;
+        max-height: 90%;
+        border: round $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #detail-scroll {
+        height: auto;
+        max-height: 16;
+    }
+    #detail {
+        color: $text-muted;
+    }
+    #buttons {
+        height: 1;
+        margin-top: 1;
+    }
+    #buttons Label {
+        margin-right: 2;
+        color: $text-muted;
+    }
+    #buttons Label.selected {
+        background: $accent;
+        color: $text;
+        text-style: bold;
+    }
+    #hint {
+        color: $text-muted;
+        margin-top: 1;
+    }
     """
 
     BINDINGS = [
         Binding("y", "yes", "Yes"),
         Binding("n,escape", "no", "No"),
+        Binding("enter", "activate", "Confirm"),
+        Binding("left", "select_yes", show=False),
+        Binding("right", "select_no", show=False),
+        Binding("tab", "toggle", show=False),
     ]
 
     def __init__(self, title: str, detail: str = ""):
         super().__init__()
         self.title_text = title
         self.detail = detail
+        self.choice = True  # "Yes" starts highlighted, like yazi
 
     def compose(self) -> ComposeResult:
         with Vertical(id="box"):
             yield Label(f"[b]{self.title_text}[/b]")
             if self.detail:
-                yield Label(self.detail)
-            yield Label("[b]y[/b] yes     [b]n[/b] no", id="hint")
-        yield Footer()
+                with VerticalScroll(id="detail-scroll"):
+                    yield Static(self.detail, markup=False, id="detail")
+            with Horizontal(id="buttons"):
+                yield Label(" Yes ", id="btn-yes")
+                yield Label(" No ", id="btn-no")
+            yield Label("y/n · ←/→ moves · enter confirms", id="hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#detail-scroll", VerticalScroll).can_focus = False
+        self._refresh_buttons()
+
+    def _refresh_buttons(self) -> None:
+        self.query_one("#btn-yes", Label).set_class(self.choice, "selected")
+        self.query_one("#btn-no", Label).set_class(not self.choice, "selected")
 
     def action_yes(self) -> None:
         self.dismiss(True)
 
     def action_no(self) -> None:
         self.dismiss(False)
+
+    def action_activate(self) -> None:
+        self.dismiss(self.choice)
+
+    def action_select_yes(self) -> None:
+        self.choice = True
+        self._refresh_buttons()
+
+    def action_select_no(self) -> None:
+        self.choice = False
+        self._refresh_buttons()
+
+    def action_toggle(self) -> None:
+        self.choice = not self.choice
+        self._refresh_buttons()
 
 
 class InfoScreen(Screen[None]):

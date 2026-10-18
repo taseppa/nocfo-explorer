@@ -65,7 +65,7 @@ All interaction happens in the middle pane, like yazi; the cursor never wraps.
 | `y` / `x` | yank (copy) / cut — marked entries, else the highlighted one |
 | `Y` / `X` | forget the yank / cut |
 | `p` / `P` | paste / force-paste (overwrite same-named files) |
-| `d` | delete (permanent — confirmation dialog lists the targets) |
+| `d` | delete (permanent — a popup lists the targets; `y`/`n` or the Yes/No selector) |
 | `a` | new folder in the open folder |
 | `r` | rename (cursor lands before the extension) |
 | `/` | search file names across the whole business |
@@ -77,9 +77,13 @@ All interaction happens in the middle pane, like yazi; the cursor never wraps.
 NoCFO's API has no trash bin and no transactional moves, so the explorer is
 careful on your behalf:
 
-* **Delete** is permanent. The dialog lists every target and flags what will
-  be skipped or risky: non-empty folders (the API refuses to delete them) and
-  files that are attached to bookings or marked not deletable.
+* **Delete** is permanent. A centered popup lists every target and asks
+  Yes/No with **Yes** highlighted (`y`/`n`, or `enter` on the selected side).
+  Folders are deleted recursively — children first, then the folder —
+  because the API only deletes empty ones; if anything inside cannot be
+  deleted (e.g. a locked file) the folder is kept whole and the failure is
+  reported. Files attached to bookings or marked not deletable are flagged
+  in the popup.
 * **Move** refuses to move a folder into itself or its own subtree.
 * **Copy** (`y` + `p`) re-uploads file bytes, preserving MIME type and notes;
   folders are copied recursively. Name collisions become `report (copy).pdf`,

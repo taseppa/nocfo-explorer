@@ -184,15 +184,60 @@ def test_delete_file_and_empty_folder():
     assert empty not in fake.folders
 
 
-def test_delete_non_empty_folder_is_skipped_before_the_api():
+def test_delete_folder_recursively():
     fake = FakeClient()
     alpha = fake.add_folder("Alpha")
-    fake.add_file("inside.txt", folder=alpha)
+    sub = fake.add_folder("Sub", parent=alpha)
+    fake.add_file("top.txt", folder=alpha)
+    fake.add_file("deep.csv", folder=sub)
+
+    assert delete_entries(fake, [Target("folder", alpha, "Alpha")]) == []
+    assert fake.folders == {}
+    assert fake.files == {}
+
+
+def test_delete_targets_already_gone_with_the_tree_are_not_failures():
+    fake = FakeClient()
+    alpha = fake.add_folder("Alpha")
+    sub = fake.add_folder("Sub", parent=alpha)
+    inside = fake.add_file("inside.txt", folder=alpha)
+
+    failures = delete_entries(
+        fake,
+        [
+            Target("folder", alpha, "Alpha"),
+            Target("folder", sub, "Sub"),  # deleted via Alpha
+            Target("file", inside, "inside.txt"),
+        ],
+    )
+    assert failures == []
+    assert fake.folders == {}
+    assert fake.files == {}
+
+
+def test_delete_folder_keeps_it_when_a_child_is_locked():
+    fake = FakeClient()
+    alpha = fake.add_folder("Alpha")
+    locked = fake.add_file("locked.txt", folder=alpha)
+    fake.add_file("free.txt", folder=alpha)
+    fake.locked.add(locked)
 
     failures = delete_entries(fake, [Target("folder", alpha, "Alpha")])
-    assert len(failures) == 1 and "not empty" in failures[0]
-    assert alpha in fake.folders  # still there
-    assert fake.count("delete_folder") == 0  # never even asked the API
+    assert any("403" in f for f in failures)  # the locked file…
+    assert any("folder kept" in f for f in failures)  # …and thus the folder
+    assert alpha in fake.folders  # kept whole, never half-deleted
+    assert locked in fake.files
+    assert not any(f["name"] == "free.txt" for f in fake.files.values())
+
+
+def test_delete_folder_with_a_parent_cycle_terminates():
+    fake = FakeClient()
+    a = fake.add_folder("A")
+    b = fake.add_folder("B", parent=a)
+    fake.folders[a]["parent"] = b  # corrupt data: a cycle
+
+    failures = delete_entries(fake, [Target("folder", a, "A")])
+    assert failures  # it cannot succeed, but it must not hang either
 
 
 def test_delete_locked_file_reports_the_403():
