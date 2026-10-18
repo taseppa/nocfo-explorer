@@ -11,8 +11,9 @@ Notes that shaped this module:
 * ``PATCH /files/{id}/`` renames (``name``) and moves (``folder_id``) a file;
   ``PATCH /folders/{id}/`` renames (``name``) and moves (``parent``) a folder.
 * Deleting a folder only succeeds when it is empty — the server answers a
-  non-empty folder with an HTML 500 page.  Callers pre-check with
-  :meth:`NoCfoClient.get_folder` instead of firing the request.
+  non-empty folder with an HTML 500 page.  ``ops.delete_entries`` works
+  around it by deleting the tree bottom-up (children first) instead of
+  firing the request at a non-empty folder.
 * ``DELETE /files/{id}/`` is refused for files the server considers unsafe to
   delete (``is_deletable: false`` on the detail endpoint), typically files
   attached to documents.

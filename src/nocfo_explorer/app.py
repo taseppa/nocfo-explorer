@@ -104,16 +104,6 @@ def is_text_preview(name: str, mime: str) -> bool:
     return mime.startswith("text/") or mime.endswith("+json") or mime.endswith("+xml")
 
 
-def type_tag(name: str, mime: str) -> str:
-    """Short right-hand tag for a file row: the extension, else the MIME."""
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    if ext and len(ext) <= 6:
-        return ext.upper()
-    if mime:
-        return mime.split("/")[-1][:6].upper()
-    return ""
-
-
 def rename_cursor_position(name: str) -> int:
     """Yazi puts the rename cursor before the last extension."""
     stem, dot, _ext = name.rpartition(".")
@@ -126,6 +116,21 @@ class _Pane(OptionList):
     Textual's default ``cursor_down``/``cursor_up`` cycle around the list;
     yazi keeps the cursor put at the top/bottom, and preview tests rely on
     that being deterministic.
+    """
+
+    DEFAULT_CSS = """
+    _Pane {
+        background: $background;
+    }
+    _Pane > .option-list--option {
+        background: $background;
+    }
+    _Pane > .option-list--option-highlighted {
+        background: $accent 40%;
+    }
+    _Pane > .option-list--option-selected {
+        background: $accent;
+    }
     """
 
     def action_cursor_down(self) -> None:
@@ -163,38 +168,43 @@ class ExplorerApp(App[None]):
     }
     #cols {
         height: 1fr;
+        background: $background;
     }
     #parent {
         height: 100%;
         width: 26;
         min-width: 12;
         padding: 0 1;
-        border-right: thick $accent;
+        background: $background;
     }
     #current {
         height: 100%;
         width: 1fr;
         padding: 0 1;
+        background: $background;
     }
     #previewcol {
         height: 100%;
         width: 44%;
         min-width: 24;
-        border-left: thick $accent;
+        background: $background;
     }
     #preview-head {
         height: auto;
         max-height: 11;
         padding: 1 1 0 1;
+        background: $background;
     }
     #preview-scroll {
         height: 1fr;
         padding: 0 1 1 1;
+        background: $background;
     }
     #preview-body {
         width: 100%;
         height: auto;
         color: $text-muted;
+        background: $background;
     }
     #status {
         height: 1;
@@ -536,9 +546,6 @@ class ExplorerApp(App[None]):
             prompt.append(e.name + "/", style="bold")
         else:
             prompt.append(e.name)
-            tag = type_tag(e.name, e.mime)
-            if tag:
-                prompt.append(f"  {tag}", style="dim")
         return Option(prompt, id=f"{e.kind}:{e.id}")
 
     def _render_current(
@@ -1163,7 +1170,11 @@ class ExplorerApp(App[None]):
             self._forget_keys(keys)
             self.invalidate()
             self.reload(cursor_key=self._survivor_key(keys))
-            self._report("deleted", len(targets), failures)
+            if isinstance(failures, tuple):
+                failures_list, deleted_total = failures[0], failures[1]
+            else:
+                failures_list, deleted_total = failures, len(targets)
+            self._report("deleted", deleted_total, failures_list)
         finally:
             self._op_busy = False
 
@@ -1182,7 +1193,7 @@ class ExplorerApp(App[None]):
             if e.kind == "folder":
                 try:
                     if client.get_folder(e.id).has_content:
-                        suffix = "  (not empty — skipped)"
+                        suffix = "  (recursive — deletes everything inside)"
                 except NoCfoError as exc:
                     suffix = f"  ({exc})"
             else:

@@ -16,7 +16,6 @@ from nocfo_explorer.app import (
     build_entries,
     is_text_preview,
     rename_cursor_position,
-    type_tag,
     _parse_option_id,
 )
 from nocfo_explorer.config import Config
@@ -29,6 +28,7 @@ from nocfo_explorer.screens import (
     TokenScreen,
 )
 from tests.conftest import FakeClient
+from textual.widgets import Label
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -124,14 +124,6 @@ def test_is_text_preview():
     assert not is_text_preview("a.bin", "application/octet-stream")
 
 
-def test_type_tag_prefers_extension_then_mime():
-    assert type_tag("report.pdf", "application/pdf") == "PDF"
-    assert type_tag("photo.heic", "") == "HEIC"
-    assert type_tag("archive.superlongext", "application/zip") == "ZIP"
-    assert type_tag("data", "application/json") == "JSON"
-    assert type_tag("data", "") == ""
-
-
 def test_build_entries_folders_first_then_files_each_sorted():
     folders = [
         NocfoFolder(id=2, name="zeta", parent=None),
@@ -163,7 +155,7 @@ def test_parse_option_id():
 # ---------------------------------------------------------------------------
 
 
-async def test_root_listing_order_tags_and_headers(cfg, fake: FakeClient):
+async def test_root_listing_order_and_headers(cfg, fake: FakeClient):
     seed_tree(fake)
     app = make_app(cfg, fake)
     async with app.run_test() as pilot:
@@ -171,8 +163,7 @@ async def test_root_listing_order_tags_and_headers(cfg, fake: FakeClient):
         assert names(app) == ["Alpha", "Zeta", "note.txt", "report.pdf"]
         rows = prompts(app)
         assert rows[0].startswith("  ") and "Alpha/" in rows[0]
-        assert "TXT" in rows[2]
-        assert "PDF" in rows[3]
+        assert "note.txt" in rows[2] and "report.pdf" in rows[3]
         assert path_text(app) == "nocfo-explorer · acme · /"
         assert "space mark" in status_text(app)
 
@@ -794,7 +785,7 @@ async def test_delete_confirm_removes_file_and_keeps_cursor_placed(cfg, fake):
         assert app.focused.id == "current"
 
 
-async def test_delete_marks_skips_nonempty_folders(cfg, fake):
+async def test_delete_marks_deletes_folders_recursively(cfg, fake):
     ids = seed_tree(fake)
     app = make_app(cfg, fake)
     async with app.run_test() as pilot:
@@ -805,17 +796,75 @@ async def test_delete_marks_skips_nonempty_folders(cfg, fake):
         assert isinstance(app.screen, ConfirmScreen)
         assert app.screen.title_text == "Delete 4 items permanently?"
         assert "Alpha/" in app.screen.detail
-        assert "(not empty — skipped)" in app.screen.detail
+        assert "(recursive" in app.screen.detail
         await pilot.press("y")
         await settle_op(pilot)
-        # Alpha survives (it has Sub), the rest of the selection is gone
-        assert ids["alpha"] in fake.folders
-        assert ids["sub"] in fake.folders
-        assert ids["zeta"] not in fake.folders
-        assert ids["note"] not in fake.files
-        assert ids["report"] not in fake.files
-        assert names(app) == ["Alpha"]
+        # Alpha goes with everything inside it (Sub, deep.csv…)
+        assert fake.folders == {}
+        assert fake.files == {}
+        assert names(app) == []
         assert app.marks == {}  # marks consumed by the delete
+
+
+async def test_delete_popup_has_yes_selected_by_default(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "d")  # note.txt
+        await settle(pilot)
+        screen = app.screen
+        assert isinstance(screen, ConfirmScreen)
+        assert screen.choice is True
+        assert screen.query_one("#btn-yes", Label).has_class("selected")
+        assert not screen.query_one("#btn-no", Label).has_class("selected")
+        await pilot.press("escape")
+
+
+async def test_delete_popup_arrows_and_tab_move_the_selector(cfg, fake):
+    seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("d")
+        await settle(pilot)
+        screen = app.screen
+        assert isinstance(screen, ConfirmScreen)
+        await pilot.press("right")
+        assert screen.choice is False
+        assert screen.query_one("#btn-no", Label).has_class("selected")
+        await pilot.press("left")
+        assert screen.choice is True
+        await pilot.press("tab")
+        assert screen.choice is False
+        await pilot.press("escape")
+
+
+async def test_delete_popup_enter_on_yes_deletes(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "d")  # note.txt
+        await settle(pilot)
+        await pilot.press("enter")  # Yes is selected by default
+        await settle_op(pilot)
+        assert ids["note"] not in fake.files
+        assert names(app) == ["Alpha", "Zeta", "report.pdf"]
+
+
+async def test_delete_popup_enter_on_no_cancels(cfg, fake):
+    ids = seed_tree(fake)
+    app = make_app(cfg, fake)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        await pilot.press("j", "j", "d")  # note.txt
+        await settle(pilot)
+        await pilot.press("right", "enter")
+        await settle(pilot)
+        assert not isinstance(app.screen, ConfirmScreen)
+        assert ids["note"] in fake.files
+        assert names(app)[2] == "note.txt"
 
 
 async def test_modal_screen_blocks_app_level_keys(cfg, fake):
